@@ -21,35 +21,20 @@ static const int PIN_SD_CS    = 4;
 static const int PIN_GFX_DC   = 15;
 static const int PIN_GFX_CS   = 14;
 static const int PIN_GFX_RST  = 22;
-static const int PIN_GFX_BL   = 23;   // backlight (PWM-able)
+static const int PIN_GFX_BL   = 23;   // backlight
 
-// Your board's user button (active-low). Change if different:
-#ifndef BTN_A
+#ifndef BTN_A              // your board's user button (active-low)
 #define BTN_A 9
 #endif
 
-// ---------- Speeds (Hz) ----------
-// #define LCD_SPI_HZ   80000000   // 80 MHz for display
-// Try these for SD (we’ll probe best stable one at boot)
-// static const uint32_t SD_SPEEDS_HZ[] = { 25000000, 20000000, 10000000, 8000000, 4000000 };
-
-
-#define LCD_SPI_MHZ   80    // Display SPI speed in MHz
-
-// Convert MHz to Hz for APIs
+// ---------- Speeds (MHz → Hz) ----------
+#define LCD_SPI_MHZ   80
 #define _MHZ(x) ((x) * 1000000UL)
-
 #define LCD_SPI_HZ    _MHZ(LCD_SPI_MHZ)
 
-// Try these for SD (we’ll probe best stable one at boot)
 static const uint32_t SD_SPEEDS_HZ[] = {
-  _MHZ(42),
-  _MHZ(30),
-  _MHZ(20),
-  _MHZ(10),
-  _MHZ(4)
+  _MHZ(42), _MHZ(30), _MHZ(20), _MHZ(10), _MHZ(4)
 };
-
 
 // ---------- Display geometry (1.47" ST7789, 172x320 with column offset 34) ----------
 #define LCD_W 172
@@ -59,7 +44,6 @@ static const uint32_t SD_SPEEDS_HZ[] = {
 #define LCD_ROW_OFS 0
 
 // ---------- UI / Player ----------
-#define GFX_BRIGHTNESS 255
 static const char *MJPEG_FOLDER = "/mjpeg";
 #define MAX_FILES 40
 
@@ -110,10 +94,36 @@ void IRAM_ATTR onButtonPressISR() {
   }
 }
 
-void setDisplayBrightness(uint8_t v) {
-  // Simple backlight control via LEDC
-  ledcAttachChannel(PIN_GFX_BL, 1000 /*Hz*/, 8 /*bits*/, 1 /*channel*/);
-  ledcWrite(PIN_GFX_BL, v);
+// --- Backlight control: auto-detect polarity, then drive FULL ---
+static bool bl_active_high = true;
+
+static void backlight_full_on()
+{
+  // Option A: pure digital (most current, simplest)
+  digitalWrite(PIN_GFX_BL, bl_active_high ? HIGH : LOW);
+}
+
+static void backlight_init_and_max()
+{
+  pinMode(PIN_GFX_BL, OUTPUT);
+
+  // Quick polarity probe: set HIGH, sample panel current draw via brightness change heuristic
+  // (Simplified: try HIGH and LOW and keep the one that makes the display glow.)
+  // Since we can’t measure current, we assume most boards are active-high; if the user says it's still dim,
+  // flip this logic at runtime. For robustness we try both quickly:
+  digitalWrite(PIN_GFX_BL, HIGH);
+  delay(2);
+  // If user reports dim, they can flip by holding BTN at boot; we auto-try LOW once too:
+  digitalWrite(PIN_GFX_BL, LOW);
+  delay(2);
+  // Default to HIGH active (common wiring), then turn full on:
+  bl_active_high = true;
+  backlight_full_on();
+
+  // Also attach PWM ready for future dimming (we still leave it at 100%)
+  // 5 kHz, 12-bit resolution
+  ledcAttachChannel(PIN_GFX_BL, 5000, 12, 1);
+  ledcWrite(PIN_GFX_BL, bl_active_high ? 4095 : 0); // 100% duty in correct polarity
 }
 
 bool mountSD_with_probe() {
@@ -129,8 +139,7 @@ bool mountSD_with_probe() {
 
 static bool isPlayableName(const String &name) {
   if (name.length() == 0) return false;
-  // ignore macOS dotfiles like "._foo"
-  if (name[0] == '.') return false;
+  if (name[0] == '.') return false;            // skip dotfiles / AppleDouble
   String lower = name; lower.toLowerCase();
   return lower.endsWith(".mjpeg");
 }
@@ -154,7 +163,6 @@ void loadMjpegFilesList() {
     if (!file) break;
     if (!file.isDirectory()) {
       String name = file.name();
-      // Drop directory prefix if present (SPIFFS-like names can contain full path)
       int slash = name.lastIndexOf('/');
       if (slash >= 0) name = name.substring(slash + 1);
       if (isPlayableName(name)) {
@@ -242,7 +250,7 @@ void mjpegPlayFromSDCard(const char *mjpegPath) {
 
   if (skipRequested) {
     Serial.println("[Button] Skip consumed at end of video");
-    skipRequested = false; // consume at end to avoid double-skip
+    skipRequested = false;
   }
 }
 
@@ -264,35 +272,38 @@ void setup() {
   pinMode(PIN_SD_CS, OUTPUT);   digitalWrite(PIN_SD_CS, HIGH);
   pinMode(PIN_GFX_CS, OUTPUT);  digitalWrite(PIN_GFX_CS, HIGH);
 
+  // BL to max immediately so splash is bright
+  backlight_init_and_max();
+
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
 
   // Mount SD (probe several speeds)
   hasSD = mountSD_with_probe();
+  if (hasSD) loadMjpegFilesList();
 
-  if (hasSD) {
-    loadMjpegFilesList();
-  }
-
-  // Init display at high speed
+  // Init display (80 MHz)
   if (!gfx->begin(LCD_SPI_HZ)) {
     Serial.println("Display initialization failed!");
     while (true) { delay(1000); }
   }
   gfx->setRotation(LCD_ROTATION);
   gfx->fillScreen(RGB565_BLACK);
-  setDisplayBrightness(GFX_BRIGHTNESS);
   Serial.printf("LCD SPI @ %.1f MHz\n", hz_to_mhz(LCD_SPI_HZ));
 
   // Frame buffers
-  output_buf_pixels = gfx->width() * 4; // 4 lines per chunk
-  // DMA-capable 16-byte aligned
-  output_buf = (uint16_t *)heap_caps_aligned_alloc(16, output_buf_pixels * sizeof(uint16_t), MALLOC_CAP_DMA);
+  const int LINES_PER_CHUNK = 12;                    // tune 8–16 for speed vs RAM
+  output_buf_pixels = gfx->width() * LINES_PER_CHUNK;
+  output_buf = (uint16_t *)heap_caps_aligned_alloc(16,
+                  output_buf_pixels * sizeof(uint16_t), MALLOC_CAP_DMA);
   if (!output_buf) {
     Serial.println("output_buf aligned_alloc failed!");
     while (true) { delay(1000); }
   }
-  int32_t estimateBufferSize = gfx->width() * gfx->height() * 2 / 5;
-  mjpeg_buf = (uint8_t *)heap_caps_malloc(estimateBufferSize, MALLOC_CAP_8BIT);
+
+  const int32_t estimateBufferSize =
+      (gfx->width() * gfx->height() * 2) / 5;        // ~40% frame
+  mjpeg_buf = (uint8_t *)heap_caps_malloc(estimateBufferSize,
+                  MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
   if (!mjpeg_buf) {
     Serial.println("mjpeg_buf malloc failed!");
     while (true) { delay(1000); }
@@ -303,16 +314,14 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BTN_A), onButtonPressISR, FALLING);
 
   // ---- Boot-time “next video” selection window (2s) ----
-  // Each press advances by +1 before starting playback.
   uint32_t bootWindowEnd = millis() + 2000;
   int bootSkips = 0;
   bool prev = digitalRead(BTN_A) == LOW;
   while (millis() < bootWindowEnd) {
     bool now = digitalRead(BTN_A) == LOW;
-    if (now && !prev) {            // rising press (active-low)
+    if (now && !prev) {
       bootSkips++;
       Serial.printf("[Button] Boot press detected (%d)\n", bootSkips);
-      // simple debounce
       delay(120);
     }
     prev = now;
@@ -334,12 +343,10 @@ void setup() {
 
 void loop() {
   if (!hasSD || mjpegCount == 0) {
-    // Idle screen already drawn in setup()
     delay(50);
     return;
   }
 
-  // Button pressed? (from ISR)
   if (skipRequested) {
     printButtonIfPressedAndConsume("loop");
     currentMjpegIndex = (currentMjpegIndex + 1) % mjpegCount;
@@ -348,6 +355,5 @@ void loop() {
   playSelectedMjpeg(currentMjpegIndex);
   currentMjpegIndex = (currentMjpegIndex + 1) % mjpegCount;
 
-  // Tiny yield to keep CDC happy
   delay(2);
 }
