@@ -1,134 +1,65 @@
-# Justfile — MJPEG builder for ESP32-C6 1.47" player
-# Requires: ffmpeg, bash
-# Usage examples:
-#   just all                  # convert every .mp4/.mov in mp4/ using "aspect" mode
-#   just force-all            # convert every file forcing 172x320
-#   just rotate-all           # rotate landscape → portrait then scale
-#   just aspect foo.mp4       # convert single file with aspect-preserve
-#   just force foo.mov        # force 172x320 for a single file
-#   just rotate bar.mp4       # rotate+scale for a single file
-#   just clean                # remove *.mjpeg in output dir
-#   just ls                   # list input files it will process
-#   just sd-sanitize /Volumes/SDCARD   # optional: minimize macOS junk on SD (non-destructive)
+# Justfile for ESP32-C6-LCD-1.47 Video Player
+# Converts all mp4 files in mp4/ → SD_CONTENT2/mjpeg/*.mjpeg
 
-#---------------------------------------
-# Config
-#---------------------------------------
-# Input and output directories (relative to this Justfile)
-MP4_DIR := "mp4"
-OUT_DIR := "SD_CONTENT2/mjpeg"
+default:
+    @just --list
 
-# Video parameters
-FPS     := "24"
-WIDTH   := "172"
-HEIGHT  := "320"
-Q       := "7"               # JPEG quality (1=best … 31=worst)
-PIXFMT  := "yuvj420p"
+# Ensure output dirs exist
+ensure-dirs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p SD_CONTENT2/mjpeg
 
-#---------------------------------------
-# Utilities
-#---------------------------------------
-set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+# List input movies
+list-movies:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -d mp4 ]]; then
+        echo "❌ No mp4/ directory found"
+        exit 1
+    fi
+    echo "🎬 Found MP4 files in mp4/:"
+    ls -1 mp4/*.mp4 2>/dev/null || echo "  (none)"
 
-# Show which files will be processed
-ls:
-	@mkdir -p {{OUT_DIR}}
-	@echo "Input dir: {{MP4_DIR}}"
-	@echo "Output dir: {{OUT_DIR}}"
-	@echo
-	@shopt -s nullglob; \
-	files=( {{MP4_DIR}}/*.mp4 {{MP4_DIR}}/*.MP4 {{MP4_DIR}}/*.mov {{MP4_DIR}}/*.MOV ); \
-	if (( $${#files[@]} == 0 )); then \
-	  echo "No input videos found in '{{MP4_DIR}}'"; \
-	else \
-	  printf "Found %d file(s):\n" "$${#files[@]}"; \
-	  printf "  %s\n" "$${files[@]}"; \
-	fi
+# Convert all .mp4 → .mjpeg (172x320, fps=17, q=8 by default)
+convert-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
 
-#---------------------------------------
-# Bulk conversions
-#---------------------------------------
+    mkdir -p SD_CONTENT2/mjpeg
+    files=(mp4/*.mp4)
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo "❌ No MP4 files found in mp4/"
+        exit 1
+    fi
 
-# Default target: convert all using aspect-preserving mode
-default: all
+    fps="${FPS:-21}"
+    q="${Q:-8}"
+    width=172
+    height=320
 
-# Keep aspect (scale width=172, height auto)
-all: _ensure-out
-	@shopt -s nullglob; \
-	for f in {{MP4_DIR}}/*.mp4 {{MP4_DIR}}/*.MP4 {{MP4_DIR}}/*.mov {{MP4_DIR}}/*.MOV; do \
-	  just aspect "$$f"; \
-	done
+    echo "⚙️ Converting ${#files[@]} file(s) to SD_CONTENT2/mjpeg/ (fps=$fps, q=$q, size=${width}x${height})"
 
-# Force to exactly 172x320 (may stretch)
-force-all: _ensure-out
-	@shopt -s nullglob; \
-	for f in {{MP4_DIR}}/*.mp4 {{MP4_DIR}}/*.MP4 {{MP4_DIR}}/*.mov {{MP4_DIR}}/*.MOV; do \
-	  just force "$$f"; \
-	done
+    for f in "${files[@]}"; do
+        base="$(basename "$f" .mp4)"
+        out="SD_CONTENT2/mjpeg/${base}.mjpeg"
+        echo "▶️  $f → $out"
+        ffmpeg -y -i "$f" \
+            -pix_fmt yuvj420p \
+            -q:v "$q" \
+            -vf "fps=$fps,scale=${width}:${height}:flags=lanczos" \
+            "$out"
+        if [[ -f "$out" ]]; then
+            echo "  ✓ $(du -h "$out" | cut -f1)  $out"
+        else
+            echo "  ✗ Failed for $f" >&2
+            exit 1
+        fi
+    done
 
-# Rotate 90° clockwise then scale 172x320 (for landscape → portrait)
-rotate-all: _ensure-out
-	@shopt -s nullglob; \
-	for f in {{MP4_DIR}}/*.mp4 {{MP4_DIR}}/*.MP4 {{MP4_DIR}}/*.mov {{MP4_DIR}}/*.MOV; do \
-	  just rotate "$$f"; \
-	done
+    echo "✅ Done. Converted ${#files[@]} movie(s) into SD_CONTENT2/mjpeg/"
 
-#---------------------------------------
-# Per-file conversions
-#---------------------------------------
+all: ensure-dirs list-movies convert-all
 
-# just aspect path/to/video.mp4
-aspect FILE:
-	@mkdir -p {{OUT_DIR}}
-	@in="$FILE"; \
-	base="$${in##*/}"; \
-	name="$${base%.*}"; \
-	out="{{OUT_DIR}}/$${name}.mjpeg"; \
-	echo "→ [aspect] $$in  →  $$out"; \
-	ffmpeg -y -i "$$in" -pix_fmt {{PIXFMT}} -q:v {{Q}} \
-	  -vf "fps={{FPS}},scale={{WIDTH}}:-1:flags=lanczos" \
-	  "$$out"
-
-# just force path/to/video.mov
-force FILE:
-	@mkdir -p {{OUT_DIR}}
-	@in="$FILE"; \
-	base="$${in##*/}"; \
-	name="$${base%.*}"; \
-	out="{{OUT_DIR}}/$${name}.mjpeg"; \
-	echo "→ [force]  $$in  →  $$out"; \
-	ffmpeg -y -i "$$in" -pix_fmt {{PIXFMT}} -q:v {{Q}} \
-	  -vf "fps={{FPS}},scale={{WIDTH}}:{{HEIGHT}}:flags=lanczos" \
-	  "$$out"
-
-# just rotate path/to/video.mp4
-rotate FILE:
-	@mkdir -p {{OUT_DIR}}
-	@in="$FILE"; \
-	base="$${in##*/}"; \
-	name="$${base%.*}"; \
-	out="{{OUT_DIR}}/$${name}.mjpeg"; \
-	echo "→ [rotate] $$in  →  $$out"; \
-	ffmpeg -y -i "$$in" -pix_fmt {{PIXFMT}} -q:v {{Q}} \
-	  -vf "transpose=1,fps={{FPS}},scale={{WIDTH}}:{{HEIGHT}}:flags=lanczos" \
-	  "$$out"
-
-#---------------------------------------
-# Housekeeping
-#---------------------------------------
-clean:
-	@shopt -s nullglob; \
-	rm -f {{OUT_DIR}}/*.mjpeg || true; \
-	echo "Cleaned {{OUT_DIR}}/*.mjpeg"
-
-_ensure-out:
-	@mkdir -p {{OUT_DIR}}
-
-# Optional: reduce macOS metadata on SD (run on the *mounted* volume path)
-# Example: just sd-sanitize /Volumes/SDCARD
-sd-sanitize MOUNT:
-	@echo "Sanitizing: {{MOUNT}}"
-	@touch "{{MOUNT}}/.metadata_never_index" || true
-	@find "{{MOUNT}}" -name ".DS_Store" -delete || true
-	@find "{{MOUNT}}" -name "._*" -delete || true
-	@echo "Done. (System folders like .Spotlight-V100 may be protected by macOS and can be ignored.)"
+sync-sd:
+    rsync -av --progress --delete ./SD_CONTENT2/mjpeg/ /Volumes/SDCARD/mjpeg/
