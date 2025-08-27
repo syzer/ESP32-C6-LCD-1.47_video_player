@@ -179,7 +179,7 @@ void IRAM_ATTR onButtonPress() {
 }
 
 static void mountSD_orScheduleRetry() {
-  const uint32_t speeds[] = { 10000000, 8000000, 4000000 };  // 10/8/4 MHz
+  const uint32_t speeds[] = { 30000000, 8000000, 4000000 };  // 10/8/4 MHz
   for (uint32_t hz : speeds) {
     if (SD.begin(PIN_SD_CS, SPI, hz)) {
       Serial.printf("SD mounted @ %u Hz\n", hz);
@@ -337,7 +337,7 @@ void setup() {
   }
 
   // Safe MJPEG work buffer allocation with fallbacks
-  size_t want = (size_t)gfx->width() * gfx->height() * 2 / 5; // ~40% of a frame
+  size_t want = (size_t)gfx->width() * gfx->height() * 4 / 5; // ~40% of a frame
   const size_t tries[] = { want, 128*1024, 96*1024, 64*1024, 48*1024 };
   for (size_t sz : tries) {
     mjpeg_buf = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
