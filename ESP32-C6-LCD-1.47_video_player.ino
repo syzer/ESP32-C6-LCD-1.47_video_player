@@ -1,10 +1,10 @@
-// ESP32-C6 1.47" ST7789 MJPEG Player (shared SPI for LCD + SD)
-// Brightness-max version (BL pin driven hard HIGH), with FPS tweaks + boot-time skip
+// ESP32-C6 1.47" ST7789 MJPEG Player (+ JPEG slideshow after videos)
+// Brightness-max version (BL pin hard HIGH), same LCD init you verified.
 //
 // Wiring (your working setup):
 //   SD:   CS=4, SCK=1, MOSI=2, MISO=3
 //   LCD:  DC=15, CS=14, RST=22, BL=23, SCK=1, MOSI=2  (shared SPI)
-//   Button: BTN_A (active-low) to skip videos (on-boot and during playback)
+//   Button: BTN_A (active-low) to skip (on-boot and during playback)
 //
 // Build notes:
 //   - Board: ESP32C6 Dev Module (Arduino core 3.2.x)
@@ -16,6 +16,9 @@
 #include <FS.h>
 #include <Arduino_GFX_Library.h>
 #include "MjpegClass.h"
+
+// Still-image decoder (JPEG only)
+#include <JPEGDEC.h>
 
 // ---------------- Pins ----------------
 static const int PIN_SD_CS     = 4;
@@ -42,11 +45,11 @@ static const int PIN_GFX_BL    = 23;
 
 // SD clock probes (fastest first)
 static const uint32_t SD_SPEEDS_HZ[] = {
-  _MHZ(42),   // 42 MHz (often fine with short wires)
+  _MHZ(42),   // 42 MHz
   _MHZ(30),   // 30 MHz
   _MHZ(20),   // 20 MHz
   _MHZ(10),   // 10 MHz
-  _MHZ(4)     //  4 MHz (safe)
+  _MHZ(4)     //  4 MHz
 };
 
 // ---------------- Display geometry (1.47" ST7789, 172x320 with column offset 34) ----------------
@@ -58,15 +61,25 @@ static const uint32_t SD_SPEEDS_HZ[] = {
 
 // ---------------- UI / Player ----------------
 static const char *MJPEG_FOLDER = "/mjpeg";
+static const char *IMAGE_FOLDER = "/jpeg";   // <---- CHANGED: stills now from /jpeg
 #define MAX_FILES 40
+
+// How long to hold each still image on screen (ms)
+#define IMAGE_HOLD_MS 2500
 
 // ---------------- Globals ----------------
 String   mjpegFileList[MAX_FILES];
 uint32_t mjpegFileSizes[MAX_FILES] = {0};
 int      mjpegCount = 0;
-static   int currentMjpegIndex = 0;
+int      currentMjpegIndex = 0;
+
+String   imgFileList[MAX_FILES];
+uint32_t imgFileSizes[MAX_FILES] = {0};
+int      imgCount = 0;
+int      currentImgIndex = 0;
 
 MjpegClass mjpeg;
+JPEGDEC    jpegStill;
 
 int         total_frames;
 uint32_t    total_read_video;
@@ -179,7 +192,7 @@ static void lcd_reg_init() {
 
     WRITE_C8_D8,  0xDE, 0x00,
     WRITE_C8_D8,  0x36, 0x00,
-    WRITE_COMMAND_8, 0x21,   // display inversion ON (adds perceived brightness/contrast)
+    WRITE_COMMAND_8, 0x21,   // inversion ON
     END_WRITE,
 
     DELAY, 10,
@@ -219,16 +232,25 @@ static bool mountSD_with_probe() {
   return false;
 }
 
-static bool isPlayableName(const String &nameIn) {
+static bool isPlayableVideoName(const String &nameIn) {
   if (nameIn.length() == 0) return false;
-  // strip directory, ignore dotfiles and AppleDouble "._"
   String name = nameIn;
   int slash = name.lastIndexOf('/');
   if (slash >= 0) name = name.substring(slash + 1);
-  if (name[0] == '.') return false;
-  if (name.startsWith("._")) return false;
+  if (name.startsWith("._") || name[0] == '.') return false;
   String lower = name; lower.toLowerCase();
   return lower.endsWith(".mjpeg");
+}
+
+static bool isDisplayableImageName(const String &nameIn) {
+  if (nameIn.length() == 0) return false;
+  String name = nameIn;
+  int slash = name.lastIndexOf('/');
+  if (slash >= 0) name = name.substring(slash + 1);
+  if (name.startsWith("._") || name[0] == '.') return false;
+  String lower = name; lower.toLowerCase();
+  // JPEG only (folder /jpeg)
+  return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
 }
 
 static void loadMjpegFilesList() {
@@ -246,7 +268,7 @@ static void loadMjpegFilesList() {
     if (!file) break;
     if (!file.isDirectory()) {
       String name = file.name();
-      if (isPlayableName(name)) {
+      if (isPlayableVideoName(name)) {
         if (mjpegCount < MAX_FILES) {
           mjpegFileList[mjpegCount]  = name;
           mjpegFileSizes[mjpegCount] = (uint32_t)file.size();
@@ -266,6 +288,41 @@ static void loadMjpegFilesList() {
   }
 }
 
+static void loadImageFilesList() {
+  imgCount = 0;
+
+  File dir = SD.open(IMAGE_FOLDER);
+  if (!dir || !dir.isDirectory()) {
+    Serial.printf("No image folder %s (optional)\n", IMAGE_FOLDER);
+    if (dir) dir.close();
+    return;
+  }
+
+  while (true) {
+    File file = dir.openNextFile();
+    if (!file) break;
+    if (!file.isDirectory()) {
+      String name = file.name();
+      if (isDisplayableImageName(name)) {
+        if (imgCount < MAX_FILES) {
+          imgFileList[imgCount]  = name;
+          imgFileSizes[imgCount] = (uint32_t)file.size();
+          imgCount++;
+        }
+      }
+    }
+    file.close();
+    if (imgCount >= MAX_FILES) break;
+  }
+  dir.close();
+
+  Serial.printf("%d image files (JPEG)\n", imgCount);
+  for (int i = 0; i < imgCount; i++) {
+    Serial.printf("  %2d: %s (%u bytes)\n", i,
+      imgFileList[i].c_str(), (unsigned)imgFileSizes[i]);
+  }
+}
+
 static void printAndConsumeButton(const char *where) {
   if (skipRequested) {
     Serial.printf("[Button] %s: skip requested\n", where);
@@ -273,6 +330,7 @@ static void printAndConsumeButton(const char *where) {
   }
 }
 
+// ------ Video draw callback ------
 static int jpegDrawCallback(JPEGDRAW *pDraw) {
   if (!pDraw || !pDraw->pPixels) return 0;
   uint32_t s = millis();
@@ -335,11 +393,78 @@ static void mjpegPlayFromSDCard(const char *mjpegPath) {
   }
 }
 
+// ------ Still image display (JPEG) ------
+
+// Still-JPEG draw callback (RGB565 little-endian from JPEGDEC)
+static int jpegStillDrawCallback(JPEGDRAW *pDraw) {
+  if (!pDraw || !pDraw->pPixels) return 0;
+  // JPEGDEC delivers RGB565 (LE), so use LE draw call:
+  gfx->draw16bitRGBBitmap(pDraw->x, pDraw->y,
+                          (uint16_t*)pDraw->pPixels,
+                          pDraw->iWidth, pDraw->iHeight);
+  return 1;
+}
+
+static bool showJPEG_still(const char *path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f || f.isDirectory()) return false;
+
+  // open() expects a File& (reference)
+  int rc = jpegStill.open(f, jpegStillDrawCallback);
+  if (rc != 1) { f.close(); return false; }
+
+  gfx->fillScreen(RGB565_BLACK);
+  // Decode to screen at (0,0); images should already be 172x320, but if not,
+  // JPEGDEC will draw at their natural size; you can add centering if needed.
+  jpegStill.decode(0, 0, 0);
+  jpegStill.close();
+  f.close();
+  return true;
+}
+
 static void playSelectedMjpeg(int idx) {
   String fullPath = String(MJPEG_FOLDER) + "/" + mjpegFileList[idx];
   Serial.printf("Playing %s\n", fullPath.c_str());
   mjpegPlayFromSDCard(fullPath.c_str());
 }
+
+static void showSelectedImage(int idx) {
+  String name = imgFileList[idx];
+  String lower = name; lower.toLowerCase();
+  String fullPath = String(IMAGE_FOLDER) + "/" + name;
+  Serial.printf("Showing image %s\n", fullPath.c_str());
+
+  bool ok = false;
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+    ok = showJPEG_still(fullPath.c_str());
+    if (!ok) Serial.println("JPEG show failed");
+  } else {
+    Serial.println("Unknown still format (expected .jpg/.jpeg)");
+  }
+
+  if (!ok) {
+    // draw a simple placeholder
+    gfx->fillScreen(RGB565_BLACK);
+    gfx->setTextColor(RGB565_WHITE);
+    gfx->setCursor(8, 8);
+    gfx->print("Failed: ");
+    gfx->println(name);
+  }
+
+  // Hold on screen, but allow skip to advance early
+  uint32_t t0 = millis();
+  while (millis() - t0 < IMAGE_HOLD_MS) {
+    if (skipRequested) {
+      printAndConsumeButton("image");
+      break;
+    }
+    delay(10);
+  }
+}
+
+// ---------------- Phases ----------------
+enum Phase { PHASE_VIDEOS, PHASE_PICTURES };
+static Phase phase = PHASE_VIDEOS;
 
 // ---------------- Arduino ----------------
 void setup() {
@@ -370,9 +495,10 @@ void setup() {
   setBacklightMax(); // <- MAX BRIGHTNESS here
   Serial.printf("LCD SPI @ %.1f MHz\n", (float)LCD_SPI_MHZ);
 
-  // List videos if SD present
+  // List videos + images if SD present
   if (hasSD) {
     loadMjpegFilesList();
+    loadImageFilesList();
   }
 
   // Allocate LCD DMA chunk (multiple lines per burst)
@@ -398,7 +524,7 @@ void setup() {
   }
 
   // Button for skipping
-  pinMode(BTN_A, INPUT); // Active-low external pull-down or pull-up? If floating, use INPUT_PULLUP
+  pinMode(BTN_A, INPUT); // if floating, change to INPUT_PULLUP
   attachInterrupt(digitalPinToInterrupt(BTN_A), onButtonPressISR, FALLING);
 
   // ---- Boot-time skip window (2s): each press advances start index ----
@@ -420,11 +546,12 @@ void setup() {
     Serial.printf("Start index advanced by %d → %d\n", bootSkips, currentMjpegIndex);
   }
 
-  if (!hasSD || mjpegCount == 0) {
+  if (!hasSD || (mjpegCount == 0 && imgCount == 0)) {
     gfx->setCursor(6, 6);
     gfx->setTextColor(RGB565_WHITE);
     gfx->setTextSize(2);
-    gfx->print(hasSD ? "No .mjpeg in /mjpeg" : "Insert SD card");
+    if (!hasSD) gfx->print("Insert SD card");
+    else        gfx->print("No media in /mjpeg or /jpeg");
     msgShown = true;
   }
 }
@@ -435,6 +562,7 @@ void loop() {
     hasSD = mountSD_with_probe();
     if (hasSD) {
       loadMjpegFilesList();
+      loadImageFilesList();
       gfx->fillScreen(RGB565_BLACK);
       msgShown = false;
     } else {
@@ -442,19 +570,47 @@ void loop() {
     }
   }
 
-  if (!hasSD || mjpegCount == 0) {
+  if (!hasSD || (mjpegCount == 0 && imgCount == 0)) {
     delay(50);
     return;
   }
 
-  // Handle skip request (from ISR)
+  // Handle skip (from ISR) between items
   if (skipRequested) {
     printAndConsumeButton("loop");
-    currentMjpegIndex = (currentMjpegIndex + 1) % mjpegCount;
+    if (phase == PHASE_VIDEOS && mjpegCount > 0) {
+      currentMjpegIndex = (currentMjpegIndex + 1) % mjpegCount;
+    } else if (phase == PHASE_PICTURES && imgCount > 0) {
+      currentImgIndex = (currentImgIndex + 1) % imgCount;
+    }
   }
 
-  playSelectedMjpeg(currentMjpegIndex);
-  currentMjpegIndex = (currentMjpegIndex + 1) % mjpegCount;
+  if (phase == PHASE_VIDEOS && mjpegCount > 0) {
+    playSelectedMjpeg(currentMjpegIndex);
+    currentMjpegIndex = (currentMjpegIndex + 1) % mjpegCount;
 
-  delay(2); // tiny yield to keep USB CDC happy
+    // Finished a full round of videos? Show pictures if any.
+    if (currentMjpegIndex == 0 && imgCount > 0) {
+      phase = PHASE_PICTURES;
+      Serial.println("---- Switching to picture slideshow ----");
+    }
+  }
+  else if (phase == PHASE_PICTURES && imgCount > 0) {
+    showSelectedImage(currentImgIndex);
+    currentImgIndex = (currentImgIndex + 1) % imgCount;
+
+    // Finished a full round of images? Back to videos if any.
+    if (currentImgIndex == 0 && mjpegCount > 0) {
+      phase = PHASE_VIDEOS;
+      Serial.println("---- Back to videos ----");
+    }
+  }
+  else {
+    // If we’re in a phase without media, bounce to the other.
+    phase = (mjpegCount > 0) ? PHASE_VIDEOS : PHASE_PICTURES;
+    delay(2);
+  }
+
+  // Tiny yield to keep CDC happy
+  delay(2);
 }
