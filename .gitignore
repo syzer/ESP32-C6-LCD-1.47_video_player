@@ -2,4 +2,5 @@ build
 .vscode
 secrets.h
 mp4/
+png/
 SD_CONTENT2/
